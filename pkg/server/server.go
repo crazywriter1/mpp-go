@@ -20,6 +20,103 @@ type Intent interface {
 	Verify(ctx context.Context, credential *mpp.Credential, request map[string]any) (*mpp.Receipt, error)
 }
 
+// Validation describes a credential accepted without consuming or broadcasting it.
+type Validation struct {
+	// Challenge is the server-issued challenge echoed by the credential.
+	Challenge mpp.ChallengeEcho
+	// Credential is the accepted credential.
+	Credential *mpp.Credential
+	// Details contains method-specific validation metadata.
+	Details map[string]any
+	// Intent is the validated payment intent.
+	Intent string
+	// Method is the validated payment method.
+	Method string
+	// Request is the challenge request bound to the credential.
+	Request map[string]any
+	// Source is the optional payer identity.
+	Source string
+}
+
+// VerifyFunc is the legacy combined credential verification hook.
+type VerifyFunc func(
+	ctx context.Context,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*mpp.Receipt, error)
+
+// ValidateFunc performs an advisory credential check without mutating payment state.
+type ValidateFunc func(
+	ctx context.Context,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*Validation, error)
+
+// BroadcastFunc finalizes a validated credential and may mutate payment state.
+type BroadcastFunc func(
+	ctx context.Context,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*mpp.Receipt, error)
+
+// IntentHooks configures either a legacy Verify hook or split Validate and Broadcast hooks.
+type IntentHooks struct {
+	// Verify configures the legacy combined verification path.
+	Verify VerifyFunc
+	// Validate configures the advisory phase of a split verification path.
+	Validate ValidateFunc
+	// Broadcast configures the settlement phase of a split verification path.
+	Broadcast BroadcastFunc
+}
+
+type verifyHookIntent struct {
+	name   string
+	verify VerifyFunc
+}
+
+type splitHookIntent struct {
+	name      string
+	validate  ValidateFunc
+	broadcast BroadcastFunc
+}
+
+// NewIntent builds an Intent from either Verify or Validate and Broadcast hooks.
+func NewIntent(name string, hooks IntentHooks) (Intent, error) {
+	if name == "" {
+		return nil, fmt.Errorf("server: intent name is required")
+	}
+	if hooks.Verify != nil && hooks.Validate == nil && hooks.Broadcast == nil {
+		return &verifyHookIntent{name: name, verify: hooks.Verify}, nil
+	}
+	if hooks.Verify == nil && hooks.Validate != nil && hooks.Broadcast != nil {
+		return &splitHookIntent{name: name, validate: hooks.Validate, broadcast: hooks.Broadcast}, nil
+	}
+	return nil, fmt.Errorf("server: intent hooks require either Verify or both Validate and Broadcast")
+}
+
+func (i *verifyHookIntent) Name() string { return i.name }
+
+func (i *verifyHookIntent) Verify(
+	ctx context.Context,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*mpp.Receipt, error) {
+	return i.verify(ctx, credential, request)
+}
+
+func (i *splitHookIntent) Name() string { return i.name }
+
+func (i *splitHookIntent) Verify(
+	ctx context.Context,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*mpp.Receipt, error) {
+	if _, err := i.validate(ctx, credential, request); err != nil {
+		return nil, err
+	}
+	return i.broadcast(ctx, credential, request)
+}
+
 // Method is the interface for server-side payment methods.
 type Method interface {
 	Name() string
@@ -52,6 +149,29 @@ func New(method Method, realm, secretKey string) *Mpp {
 // Realm returns the WWW-Authenticate realm used by this payment handler.
 func (m *Mpp) Realm() string {
 	return m.realm
+}
+
+// ValidateCredential validates an issued credential without consuming or broadcasting it.
+func (m *Mpp) ValidateCredential(ctx context.Context, credential *mpp.Credential) (*Validation, error) {
+	intent, request, err := m.prepareCredential(credential)
+	if err != nil {
+		return nil, err
+	}
+	return validateCredential(ctx, intent, credential, request, m.method.Name())
+}
+
+// BroadcastCredential validates and settles an issued credential.
+func (m *Mpp) BroadcastCredential(ctx context.Context, credential *mpp.Credential) (*mpp.Receipt, error) {
+	intent, request, err := m.prepareCredential(credential)
+	if err != nil {
+		return nil, err
+	}
+	return intent.Verify(ctx, credential, request)
+}
+
+// VerifyCredential is a backwards-compatible alias for BroadcastCredential.
+func (m *Mpp) VerifyCredential(ctx context.Context, credential *mpp.Credential) (*mpp.Receipt, error) {
+	return m.BroadcastCredential(ctx, credential)
 }
 
 // ChargeParams contains the parameters for a charge operation.

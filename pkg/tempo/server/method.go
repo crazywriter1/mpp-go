@@ -33,15 +33,16 @@ type MethodConfig struct {
 
 // Method adapts Tempo charge configuration to the generic server interfaces.
 type Method struct {
-	intent         *Intent
-	currency       string
-	recipient      string
-	decimals       int
-	chainID        int64
-	feePayer       bool
-	feePayerURL    string
-	memo           string
-	supportedModes []tempo.ChargeMode
+	intent               mppserver.Intent
+	currency             string
+	recipient            string
+	decimals             int
+	chainID              int64
+	feePayer             bool
+	feePayerURL          string
+	memo                 string
+	supportedModes       []tempo.ChargeMode
+	supportsUnknownChain bool
 }
 
 var _ mppserver.Method = (*Method)(nil)
@@ -66,15 +67,16 @@ func NewMethod(config MethodConfig) *Method {
 		currency = tempo.DefaultCurrencyForChain(chainID)
 	}
 	return &Method{
-		intent:         intent,
-		currency:       currency,
-		recipient:      config.Recipient,
-		decimals:       decimals,
-		chainID:        chainID,
-		feePayer:       config.FeePayer,
-		feePayerURL:    config.FeePayerURL,
-		memo:           config.Memo,
-		supportedModes: append([]tempo.ChargeMode(nil), config.SupportedModes...),
+		intent:               intent,
+		currency:             currency,
+		recipient:            config.Recipient,
+		decimals:             decimals,
+		chainID:              chainID,
+		feePayer:             config.FeePayer,
+		feePayerURL:          config.FeePayerURL,
+		memo:                 config.Memo,
+		supportedModes:       append([]tempo.ChargeMode(nil), config.SupportedModes...),
+		supportsUnknownChain: intent.rpc != nil || intent.rpcURL != "",
 	}
 }
 
@@ -108,7 +110,7 @@ func (m *Method) BuildChargeRequest(params mppserver.ChargeParams) (map[string]a
 	if chainID == 0 {
 		chainID = m.chainID
 	}
-	if chainID != 0 && m.intent.rpc == nil && m.intent.rpcURL == "" && !tempo.IsKnownChainID(chainID) {
+	if chainID != 0 && !tempo.IsKnownChainID(chainID) && !m.supportsUnknownChain {
 		return nil, fmt.Errorf("tempo server: unknown chain id %d; configure Intent.RPC or Intent.RPCURL explicitly", chainID)
 	}
 	memo := params.Memo
