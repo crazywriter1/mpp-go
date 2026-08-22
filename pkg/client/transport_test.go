@@ -49,6 +49,7 @@ func challengeForURL(t *testing.T, rawURL, method string, request map[string]any
 		return *new(*mpp.Challenge)
 	}
 
+	opts = append([]mpp.ChallengeOption{mpp.WithExpires(mpp.Expires.Minutes(5))}, opts...)
 	return mpp.NewChallenge("secret", parsedURL.Host, method, "payment", request, opts...)
 }
 
@@ -182,6 +183,29 @@ func TestTransport_RoundTrip_402ExpiredChallenge(t *testing.T) {
 		return
 	}
 
+}
+
+func TestTransport_RoundTrip_402EmptyExpiresIsSkipped(t *testing.T) {
+	challenge := mpp.NewChallenge("secret", "realm", "tempo", "payment", nil)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", challenge.ToAuthenticate("realm"))
+		w.WriteHeader(http.StatusPaymentRequired)
+		w.Write([]byte("missing expires"))
+	}))
+	defer srv.Close()
+
+	method := &mockMethod{name: "tempo", cred: newTestCredential("tempo")}
+	tr := NewTransport([]Method{method}, nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	resp, err := tr.RoundTrip(req)
+	if !assert.NoErrorf(t, err, "unexpected error: %v", err) {
+		return
+	}
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusPaymentRequired, resp.StatusCode)
+	assert.Equalf(t, 0, method.calls,
+		"CreateCredential() calls = %d, want 0 for missing expires", method.calls)
 }
 
 func TestTransport_RoundTrip_402UnparseableExpiresIsSkipped(t *testing.T) {

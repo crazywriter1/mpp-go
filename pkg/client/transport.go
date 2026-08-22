@@ -56,18 +56,21 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	now := time.Now().UTC()
 	for i := range challenges {
 		ch := &challenges[i]
-		if ch.Expires != "" {
-			expiry, err := parseChallengeExpiry(ch.Expires)
-			if err != nil {
-				// Unparseable expiry: the issuing server rejects such a
-				// credential (server.VerifyOrChallenge returns "invalid expires
-				// format"), so don't waste a payment on a challenge it would
-				// refuse. Skip it.
-				continue
-			}
-			if expiry.Before(now) {
-				continue
-			}
+		if ch.Expires == "" {
+			// Missing expiry: server.VerifyOrChallenge rejects credentials
+			// without expires ("missing required expires"), so don't pay.
+			continue
+		}
+		expiry, err := parseChallengeExpiry(ch.Expires)
+		if err != nil {
+			// Unparseable expiry: the issuing server rejects such a
+			// credential (server.VerifyOrChallenge returns "invalid expires
+			// format"), so don't waste a payment on a challenge it would
+			// refuse. Skip it.
+			continue
+		}
+		if expiry.Before(now) {
+			continue
 		}
 		if m, ok := t.methods[ch.Method]; ok {
 			matched = ch
