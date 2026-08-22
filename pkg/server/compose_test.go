@@ -562,6 +562,56 @@ func TestComposeMiddleware_ReturnsMalformedCredentialForInvalidEchoedRequest(t *
 		return
 	}
 
+	if !assert.NotEmpty(t, paid.Header.Values("WWW-Authenticate"),
+		"expected fresh WWW-Authenticate challenge on malformed credential") {
+		return
+	}
+
+}
+
+func TestComposeMiddleware_ReturnsFreshChallengeForUnparseableCredential(t *testing.T) {
+	methodA := newTestServer(t, composeTestMethod{name: "alpha"}, composeRealm, composeSecret)
+	methodB := newTestServer(t, composeTestMethod{name: "beta"}, composeRealm, composeSecret)
+
+	srv := composeTestServer(t,
+		ComposeConfig{Mpp: methodA, Params: ChargeParams{Amount: "1.00"}},
+		ComposeConfig{Mpp: methodB, Params: ChargeParams{Amount: "2.00"}},
+	)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if !assert.NoErrorf(t, err,
+		"http.NewRequest() error = %v", err) {
+		return
+	}
+	req.Header.Set("Authorization", "Payment !!!not-valid-base64!!!")
+
+	resp, err := http.DefaultClient.Do(req)
+	if !assert.NoErrorf(t, err,
+		"Do() error = %v", err) {
+		return
+	}
+	defer resp.Body.Close()
+
+	if !assert.Equalf(t, http.StatusPaymentRequired, resp.StatusCode,
+		"status = %d, want %d", resp.StatusCode, http.StatusPaymentRequired) {
+		return
+	}
+
+	wwwAuth := resp.Header.Values("WWW-Authenticate")
+	if !assert.Lenf(t, wwwAuth, 2,
+		"got %d WWW-Authenticate headers, want 2 fresh compose challenges", len(wwwAuth)) {
+		return
+	}
+
+	var problem struct {
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		assert.Failf(t, "", "Decode(problem) error = %v", err)
+		return
+	}
+	assert.Equal(t, string(mpp.ErrorTypeMalformedCredential), problem.Type)
 }
 
 func TestComposeMiddleware_SingleMethod(t *testing.T) {
