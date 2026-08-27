@@ -62,7 +62,7 @@ func ComposeMiddleware(configs ...ComposeConfig) func(http.Handler) http.Handler
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			auth := r.Header.Get("Authorization")
+			auth := r.Header.Get(mpp.HeaderAuthorization)
 			paymentAuth, err := mpp.FindPaymentAuthorizationStrict(auth)
 			if err != nil {
 				WritePaymentError(w, mpp.ErrBadRequest(err.Error()))
@@ -212,7 +212,7 @@ func writeComposeChallengeResponse(w http.ResponseWriter, challenges []*mpp.Chal
 			WritePaymentError(w, mpp.ErrBadRequest(headerErr.Error()))
 			return
 		}
-		w.Header().Add("WWW-Authenticate", header)
+		w.Header().Add(mpp.HeaderWWWAuthenticate, header)
 	}
 
 	if err != nil {

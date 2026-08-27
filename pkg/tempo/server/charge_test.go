@@ -3,6 +3,7 @@ package chargeserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -15,7 +16,9 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tempoxyz/mpp-go/pkg/mpp"
+	"github.com/tempoxyz/mpp-go/pkg/server"
 	"github.com/tempoxyz/mpp-go/pkg/tempo"
 	"github.com/tempoxyz/mpp-go/pkg/tempo/client"
 	temporpc "github.com/tempoxyz/tempo-go/pkg/client"
@@ -28,7 +31,9 @@ const (
 	// testPrivateKey is the fixed payer key used across Tempo charge tests.
 	testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 	// feePayerKey is the co-signer key used for sponsored-transaction tests.
-	feePayerKey     = "0xdd83cd66cd98801a07e0b7c1a5b02364b369e696da7c0ab444acffea5cca86fc"
+	feePayerKey = "0xdd83cd66cd98801a07e0b7c1a5b02364b369e696da7c0ab444acffea5cca86fc"
+	// accessKey is a deterministic test-only key authorized by testPrivateKey.
+	accessKey       = "0x0000000000000000000000000000000000000000000000000000000000000003"
 	testCurrency    = "0x20c0000000000000000000000000000000000001"
 	testRecipient   = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
 	testRealm       = "api.example.com"
@@ -74,10 +79,46 @@ type mockRPC struct {
 	callResult       string
 	receipts         map[string]map[string]any
 	sentRawTxs       []string
+	callRequests     []map[string]any
 	estimateGasCalls []map[string]any
+	onCall           func(params ...interface{}) (*temporpc.JSONRPCResponse, error)
 	onSend           func(raw string) (string, map[string]any, error)
 	onEstimateGas    func(params ...interface{}) (*temporpc.JSONRPCResponse, error)
 	onGetReceipt     func(hash string) (*temporpc.JSONRPCResponse, error)
+}
+
+type recordingStore struct {
+	inner            tempo.Store
+	deleteErr        error
+	deleteCalls      int
+	putCalls         int
+	putIfAbsentCalls int
+}
+
+func newRecordingStore() *recordingStore {
+	return &recordingStore{inner: tempo.NewMemoryStore()}
+}
+
+func (s *recordingStore) Get(ctx context.Context, key string) (string, bool, error) {
+	return s.inner.Get(ctx, key)
+}
+
+func (s *recordingStore) Put(ctx context.Context, key, value string) error {
+	s.putCalls++
+	return s.inner.Put(ctx, key, value)
+}
+
+func (s *recordingStore) PutIfAbsent(ctx context.Context, key, value string) (bool, error) {
+	s.putIfAbsentCalls++
+	return s.inner.PutIfAbsent(ctx, key, value)
+}
+
+func (s *recordingStore) Delete(ctx context.Context, key string) error {
+	s.deleteCalls++
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.inner.Delete(ctx, key)
 }
 
 func (m *mockRPC) GetChainID(context.Context) (uint64, error) {
@@ -118,6 +159,14 @@ func (m *mockRPC) SendRequest(_ context.Context, method string, params ...interf
 		}
 		return &temporpc.JSONRPCResponse{Result: m.estimateGas}, nil
 	case "eth_call":
+		if len(params) > 0 {
+			if callObject, ok := params[0].(map[string]any); ok {
+				m.callRequests = append(m.callRequests, callObject)
+			}
+		}
+		if m.onCall != nil {
+			return m.onCall(params...)
+		}
 		return &temporpc.JSONRPCResponse{Result: m.callResult}, nil
 	case "eth_getTransactionReceipt":
 		hash := params[0].(string)
@@ -128,6 +177,261 @@ func (m *mockRPC) SendRequest(_ context.Context, method string, params ...interf
 	default:
 		return nil, fmt.Errorf("unexpected rpc method %q", method)
 	}
+}
+
+func TestIntentTransactionCredentialLifecycle(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, false, []tempo.ChargeMode{tempo.ChargeModePull})
+	rpc := newMockRPC(request)
+	requestMap := request.Map()
+	scope := map[string]any{
+		"resource": "/paid",
+		"route":    "/paid",
+	}
+	requestMap["_mppx_scope"] = scope
+	challenge := mpp.NewChallenge(
+		"test-secret-key-minimum-32-byte-secret",
+		testRealm,
+		tempo.MethodName,
+		tempo.IntentCharge,
+		requestMap,
+		mpp.WithExpires(mpp.Expires.Minutes(5)),
+	)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, challenge)
+	require.NoError(t, err)
+	rpc.callRequests = nil
+	store := newRecordingStore()
+	method, err := MethodFromConfig(Config{RPC: rpc, Store: store})
+	require.NoError(t, err)
+	payment, err := server.New(method, testRealm, "test-secret-key-minimum-32-byte-secret")
+	require.NoError(t, err)
+
+	validation, err := payment.ValidateCredential(ctx, credential)
+	require.NoError(t, err)
+	assert.Equal(t, "pull", validation.Details["mode"])
+	assert.Equal(t, credential.Source, validation.Source)
+	assert.NotEmpty(t, validation.Details["sender"])
+	assert.Equal(t, credential.Payload["signature"], validation.Details["serializedTransaction"])
+	assert.Len(t, validation.Details["transfers"], 1)
+	assert.Equal(t, scope, validation.Request["_mppx_scope"])
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Len(t, rpc.callRequests, 1)
+	assert.Zero(t, store.putCalls)
+	assert.Zero(t, store.putIfAbsentCalls)
+	assert.Zero(t, store.deleteCalls)
+
+	receipt, err := payment.BroadcastCredential(ctx, credential)
+	require.NoError(t, err)
+	assert.Equal(t, testReceiptHash, receipt.Reference)
+	assert.Len(t, rpc.sentRawTxs, 1)
+	assert.Len(t, rpc.callRequests, 3)
+	assert.Equal(t, 1, store.putIfAbsentCalls)
+}
+
+func TestValidationTransferDetailsDistinguishesAttributionFromWildcardMemo(t *testing.T) {
+	request := buildRequest(t, false, []tempo.ChargeMode{tempo.ChargeModePull})
+	request.MethodDetails.Splits = []tempo.Split{{
+		Amount:    "100000",
+		Recipient: "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+	}}
+
+	details := validationTransferDetails(request)
+	require.Len(t, details, 2)
+	assert.Equal(t, true, details[0]["requireAttribution"])
+	assert.NotContains(t, details[0], "allowAnyMemo")
+	assert.Equal(t, true, details[1]["allowAnyMemo"])
+	assert.NotContains(t, details[1], "requireAttribution")
+}
+
+func TestIntentValidateTransactionRejectsFailedSimulationWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, false, []tempo.ChargeMode{tempo.ChargeModePull})
+	rpc := newMockRPC(request)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	rpc.callRequests = nil
+	rpc.onCall = func(...interface{}) (*temporpc.JSONRPCResponse, error) {
+		return temporpc.NewJSONRPCErrorResponse(1, temporpc.InvalidTransactionType, "execution reverted", nil), nil
+	}
+	store := newRecordingStore()
+	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+	require.NoError(t, err)
+
+	_, err = intent.Validate(ctx, credential, request.Map())
+	require.ErrorContains(t, err, "transaction preflight failed")
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Len(t, rpc.callRequests, 1)
+	assert.Zero(t, store.putIfAbsentCalls)
+	assert.Zero(t, store.deleteCalls)
+}
+
+func TestIntentBroadcastRejectsCredentialExpiringDuringValidation(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, false, []tempo.ChargeMode{tempo.ChargeModePull})
+	rpc := newMockRPC(request)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	rpc.callRequests = nil
+	rpc.onCall = func(...interface{}) (*temporpc.JSONRPCResponse, error) {
+		credential.Challenge.Expires = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		return &temporpc.JSONRPCResponse{Result: rpc.callResult}, nil
+	}
+	store := newRecordingStore()
+	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+	require.NoError(t, err)
+
+	_, err = intent.Broadcast(ctx, credential, request.Map())
+	require.ErrorContains(t, err, "expired")
+	assert.Len(t, rpc.callRequests, 1)
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Zero(t, store.putIfAbsentCalls)
+	assert.Zero(t, store.deleteCalls)
+}
+
+func TestIntentBroadcastSurfacesSponsoredReplayReleaseFailure(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, true, []tempo.ChargeMode{tempo.ChargeModePull})
+	rpc := newMockRPC(request)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	rpc.callRequests = nil
+	simulations := 0
+	rpc.onCall = func(...interface{}) (*temporpc.JSONRPCResponse, error) {
+		simulations++
+		if simulations == 2 {
+			credential.Challenge.Expires = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		}
+		return &temporpc.JSONRPCResponse{Result: rpc.callResult}, nil
+	}
+	store := newRecordingStore()
+	store.deleteErr = errors.New("delete unavailable")
+	intent, err := NewIntent(IntentConfig{
+		RPC:                rpc,
+		Store:              store,
+		FeePayerPrivateKey: feePayerKey,
+	})
+	require.NoError(t, err)
+
+	_, err = intent.Broadcast(ctx, credential, request.Map())
+	require.ErrorContains(t, err, "expired")
+	require.ErrorContains(t, err, "failed to release sponsored replay claim: delete unavailable")
+	assert.Len(t, rpc.callRequests, 2)
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Equal(t, 1, store.putIfAbsentCalls)
+	assert.Equal(t, 1, store.deleteCalls)
+}
+
+func TestIntentValidatePushAndProofCredentialsDoesNotConsumeReplayState(t *testing.T) {
+	tests := []struct {
+		name           string
+		credentialType tempo.CredentialType
+		prepareRequest func(tempo.ChargeRequest) tempo.ChargeRequest
+		wantMode       string
+	}{
+		{
+			name:           "push",
+			credentialType: tempo.CredentialTypeHash,
+			prepareRequest: func(request tempo.ChargeRequest) tempo.ChargeRequest {
+				request.MethodDetails.SupportedModes = []tempo.ChargeMode{tempo.ChargeModePush}
+				return request
+			},
+			wantMode: "push",
+		},
+		{
+			name:           "proof",
+			credentialType: tempo.CredentialTypeProof,
+			prepareRequest: func(request tempo.ChargeRequest) tempo.ChargeRequest {
+				request.Amount = "0"
+				return request
+			},
+			wantMode: "proof",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			request := tt.prepareRequest(buildRequest(t, false, nil))
+			rpc := newMockRPC(request)
+			credential, err := newClientMethod(t, rpc, tt.credentialType).CreateCredential(ctx, buildChallenge(t, request))
+			require.NoError(t, err)
+			store := newRecordingStore()
+			intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+			require.NoError(t, err)
+
+			for range 2 {
+				validation, err := intent.Validate(ctx, credential, request.Map())
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantMode, validation.Details["mode"])
+			}
+			assert.Zero(t, store.putIfAbsentCalls)
+
+			_, err = intent.Broadcast(ctx, credential, request.Map())
+			require.NoError(t, err)
+			assert.Equal(t, 1, store.putIfAbsentCalls)
+
+			_, err = intent.Validate(ctx, credential, request.Map())
+			require.NoError(t, err)
+			_, err = intent.Broadcast(ctx, credential, request.Map())
+			require.ErrorContains(t, err, "already used")
+			assert.Equal(t, 2, store.putIfAbsentCalls)
+		})
+	}
+}
+
+func TestIntentValidateSponsoredCredentialDoesNotInvokeFeePayer(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, true, []tempo.ChargeMode{tempo.ChargeModePull})
+	feePayerCalls := 0
+	feePayerServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		feePayerCalls++
+	}))
+	defer feePayerServer.Close()
+	request.MethodDetails.FeePayerURL = feePayerServer.URL
+	rpc := newMockRPC(request)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	rpc.estimateGasCalls = nil
+	rpc.callRequests = nil
+	store := newRecordingStore()
+	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+	require.NoError(t, err)
+
+	validation, err := intent.Validate(ctx, credential, request.Map())
+	require.NoError(t, err)
+	assert.Equal(t, "pull", validation.Details["mode"])
+	assert.Zero(t, feePayerCalls)
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Empty(t, rpc.estimateGasCalls)
+	assert.Empty(t, rpc.callRequests)
+	assert.Zero(t, store.putIfAbsentCalls)
+}
+
+func TestIntentBroadcastSponsoredCredentialSimulatesBeforeFeePayer(t *testing.T) {
+	ctx := context.Background()
+	request := buildRequest(t, true, []tempo.ChargeMode{tempo.ChargeModePull})
+	feePayerCalls := 0
+	feePayerServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		feePayerCalls++
+	}))
+	defer feePayerServer.Close()
+	request.MethodDetails.FeePayerURL = feePayerServer.URL
+	rpc := newMockRPC(request)
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	rpc.callRequests = nil
+	rpc.onCall = func(...interface{}) (*temporpc.JSONRPCResponse, error) {
+		return temporpc.NewJSONRPCErrorResponse(1, temporpc.InvalidTransactionType, "execution reverted", nil), nil
+	}
+	store := newRecordingStore()
+	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+	require.NoError(t, err)
+
+	_, err = intent.Broadcast(ctx, credential, request.Map())
+	require.ErrorContains(t, err, "transaction preflight failed")
+	assert.Len(t, rpc.callRequests, 1)
+	assert.Zero(t, feePayerCalls)
+	assert.Empty(t, rpc.sentRawTxs)
+	assert.Zero(t, store.putIfAbsentCalls)
 }
 
 func TestChargeFlow_FeePayerTransactionViaRemoteSigner(t *testing.T) {
@@ -304,6 +608,238 @@ func TestChargeFlow_FeePayerTransactionViaRemoteSignerRejectsTamperedFeeToken(t 
 		return
 	}
 
+}
+
+func TestChargeHTTPFlow_KeychainFeePayerSigningForm(t *testing.T) {
+	cases := []struct {
+		name          string
+		legacyYParity bool
+	}{
+		{name: "canonical y parity"},
+		{name: "legacy y parity", legacyYParity: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			request := buildRequest(t, true, nil)
+			rpc := newMockRPC(request)
+
+			rootSigner, err := temposigner.NewSigner(testPrivateKey)
+			if err != nil {
+				t.Fatalf("NewSigner(root) error = %v", err)
+			}
+			feePayerSigner, err := temposigner.NewSigner(feePayerKey)
+			if err != nil {
+				t.Fatalf("NewSigner(fee payer) error = %v", err)
+			}
+
+			rpc.onSend = func(raw string) (string, map[string]any, error) {
+				broadcast, err := tempotx.Deserialize(raw)
+				if err != nil {
+					return "", nil, err
+				}
+				if broadcast.Signature == nil || broadcast.Signature.Type != "keychain" {
+					return "", nil, fmt.Errorf("broadcast signature = %#v, want keychain", broadcast.Signature)
+				}
+				if broadcast.KeyAuthorization == nil {
+					return "", nil, fmt.Errorf("broadcast omitted key authorization")
+				}
+				if broadcast.FeeToken != common.HexToAddress(request.Currency) {
+					return "", nil, fmt.Errorf("broadcast fee token = %s, want %s", broadcast.FeeToken.Hex(), request.Currency)
+				}
+				gotParity := broadcast.Signature.Raw[keychain.KeychainSignatureLength-1]
+				if tc.legacyYParity && gotParity != 27 && gotParity != 28 {
+					return "", nil, fmt.Errorf("broadcast y parity = %d, want unmodified legacy parity", gotParity)
+				}
+				if !tc.legacyYParity && gotParity != 0 && gotParity != 1 {
+					return "", nil, fmt.Errorf("broadcast y parity = %d, want canonical parity", gotParity)
+				}
+				feePayer, err := tempotx.VerifyFeePayerSignature(broadcast, rootSigner.Address())
+				if err != nil {
+					return "", nil, err
+				}
+				if feePayer != feePayerSigner.Address() {
+					return "", nil, fmt.Errorf("broadcast fee payer = %s, want %s", feePayer.Hex(), feePayerSigner.Address().Hex())
+				}
+				return testReceiptHash, buildReceipt(raw, request, rootSigner.Address()), nil
+			}
+
+			intent, err := NewIntent(IntentConfig{RPC: rpc, FeePayerPrivateKey: feePayerKey})
+			if err != nil {
+				t.Fatalf("NewIntent() error = %v", err)
+			}
+			method := NewMethod(MethodConfig{
+				Intent:    intent,
+				Currency:  testCurrency,
+				Recipient: testRecipient,
+				ChainID:   42431,
+				FeePayer:  true,
+			})
+			payment, err := server.New(method, testRealm, "test-secret-key-at-least-32-bytes")
+			if err != nil {
+				t.Fatalf("server.New() error = %v", err)
+			}
+			handler := server.ChargeMiddleware(payment, server.ChargeParams{
+				Amount:   "0.50",
+				FeePayer: true,
+			})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			httpServer := httptest.NewServer(handler)
+			defer httpServer.Close()
+
+			challengeResponse, err := httpServer.Client().Get(httpServer.URL)
+			if err != nil {
+				t.Fatalf("GET challenge error = %v", err)
+			}
+			_ = challengeResponse.Body.Close()
+			if challengeResponse.StatusCode != http.StatusPaymentRequired {
+				t.Fatalf("challenge status = %d, want %d", challengeResponse.StatusCode, http.StatusPaymentRequired)
+			}
+			challenge, err := mpp.ParseChallenge(challengeResponse.Header.Get("WWW-Authenticate"))
+			if err != nil {
+				t.Fatalf("ParseChallenge() error = %v", err)
+			}
+			credential := buildKeychainFeePayerCredential(t, rpc, challenge, keychainCredentialOptions{
+				legacyYParity: tc.legacyYParity,
+			})
+
+			paidRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL, nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext() error = %v", err)
+			}
+			paidRequest.Header.Set("Authorization", credential.ToAuthorization())
+			paidResponse, err := httpServer.Client().Do(paidRequest)
+			if err != nil {
+				t.Fatalf("paid GET error = %v", err)
+			}
+			_ = paidResponse.Body.Close()
+			if paidResponse.StatusCode != http.StatusOK {
+				t.Fatalf("paid status = %d, want %d", paidResponse.StatusCode, http.StatusOK)
+			}
+			if _, err := mpp.ParseReceipt(paidResponse.Header.Get("Payment-Receipt")); err != nil {
+				t.Fatalf("ParseReceipt() error = %v", err)
+			}
+			if len(rpc.sentRawTxs) != 1 {
+				t.Fatalf("broadcast count = %d, want 1", len(rpc.sentRawTxs))
+			}
+		})
+	}
+}
+
+func TestChargeFlow_KeychainFeePayerSigningFormRejectsTampering(t *testing.T) {
+	cases := []struct {
+		name      string
+		options   keychainCredentialOptions
+		wantError string
+	}{
+		{
+			name:      "sender does not match keychain root",
+			options:   keychainCredentialOptions{sender: common.HexToAddress("0x1111111111111111111111111111111111111111")},
+			wantError: "transaction signature is invalid",
+		},
+		{
+			name:      "sender is zero address",
+			options:   keychainCredentialOptions{zeroSender: true},
+			wantError: "failed to deserialize transaction payload",
+		},
+		{
+			name:      "fee token does not match request",
+			options:   keychainCredentialOptions{feeToken: common.HexToAddress("0x20c0000000000000000000000000000000000002")},
+			wantError: "fee payer transaction fee token does not match the charge request",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := buildRequest(t, true, nil)
+			rpc := newMockRPC(request)
+			challenge := buildChallenge(t, request)
+			credential := buildKeychainFeePayerCredential(t, rpc, challenge, tc.options)
+			intent, err := NewIntent(IntentConfig{RPC: rpc, FeePayerPrivateKey: feePayerKey})
+			if err != nil {
+				t.Fatalf("NewIntent() error = %v", err)
+			}
+
+			_, err = intent.Verify(context.Background(), credential, request.Map())
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("Verify() error = %v, want %q", err, tc.wantError)
+			}
+			if len(rpc.sentRawTxs) != 0 {
+				t.Fatalf("broadcast count = %d, want 0", len(rpc.sentRawTxs))
+			}
+		})
+	}
+}
+
+type keychainCredentialOptions struct {
+	feeToken      common.Address
+	legacyYParity bool
+	sender        common.Address
+	zeroSender    bool
+}
+
+func buildKeychainFeePayerCredential(
+	t *testing.T,
+	rpc tempo.RPCClient,
+	challenge *mpp.Challenge,
+	options keychainCredentialOptions,
+) *mpp.Credential {
+	t.Helper()
+
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(context.Background(), challenge)
+	if err != nil {
+		t.Fatalf("CreateCredential() error = %v", err)
+	}
+	tx, err := tempotx.Deserialize(credential.Payload["signature"].(string))
+	if err != nil {
+		t.Fatalf("Deserialize(seed) error = %v", err)
+	}
+
+	rootSigner, err := temposigner.NewSigner(testPrivateKey)
+	if err != nil {
+		t.Fatalf("NewSigner(root) error = %v", err)
+	}
+	accessSigner, err := temposigner.NewSigner(accessKey)
+	if err != nil {
+		t.Fatalf("NewSigner(access) error = %v", err)
+	}
+	tx.Signature = nil
+	tx.From = common.Address{}
+	feeToken := options.feeToken
+	if feeToken == (common.Address{}) {
+		feeToken = common.HexToAddress(testCurrency)
+	}
+	tx.FeeToken = feeToken
+	authorization := keychain.NewKeyAuthorization(42431, keychain.SignatureTypeSecp256k1, accessSigner.Address()).
+		WithExpiry(uint64(time.Now().Add(5 * time.Minute).Unix()))
+	if err := authorization.SignAndAttach(tx, rootSigner); err != nil {
+		t.Fatalf("SignAndAttach() error = %v", err)
+	}
+	if err := keychain.SignWithAccessKey(tx, accessSigner, rootSigner.Address()); err != nil {
+		t.Fatalf("SignWithAccessKey() error = %v", err)
+	}
+	if options.legacyYParity {
+		tx.Signature.Raw[keychain.KeychainSignatureLength-1] += 27
+	}
+
+	sender := options.sender
+	if sender == (common.Address{}) && !options.zeroSender {
+		sender = rootSigner.Address()
+	}
+	serialized, err := tempotx.Serialize(tx, &tempotx.SerializeOptions{
+		Format: tempotx.FormatFeePayer,
+		Sender: sender,
+	})
+	if err != nil {
+		t.Fatalf("Serialize(FormatFeePayer) error = %v", err)
+	}
+	if !strings.HasPrefix(serialized, "0x78") {
+		t.Fatalf("serialized transaction prefix = %.4s, want 0x78", serialized)
+	}
+	credential.Payload["signature"] = serialized
+	return credential
 }
 
 func TestChargeFlow_ProofCredentialWithAccessKey(t *testing.T) {
@@ -938,35 +1474,39 @@ func TestChargeFlow_FeePayerTransactionFailsPreflightBeforeBroadcast(t *testing.
 	ctx := context.Background()
 	request := buildRequest(t, true, nil)
 	rpc := newMockRPC(request)
-	rpc.onEstimateGas = func(params ...interface{}) (*temporpc.JSONRPCResponse, error) {
+	rpc.onCall = func(params ...interface{}) (*temporpc.JSONRPCResponse, error) {
 		callObject, ok := params[0].(map[string]any)
 		if !assert.Truef(t, ok,
-			"estimateGas params[0] type = %T, want map[string]any", params[0]) {
+			"eth_call params[0] type = %T, want map[string]any", params[0]) {
 			return *new(*temporpc.JSONRPCResponse), *new(error)
 		}
 
-		if _, ok := callObject["calls"]; !ok {
-			return &temporpc.JSONRPCResponse{Result: rpc.estimateGas}, nil
+		if _, finalEnvelope := callObject["feePayer"]; !finalEnvelope {
+			assert.Equal(t, map[string]any{
+				"calls": callObject["calls"],
+				"from":  callObject["from"],
+			}, callObject)
+			return &temporpc.JSONRPCResponse{Result: rpc.callResult}, nil
 		}
 		if !assert.NotEqual(t, "", callObject["from"],
-			"estimateGas call object missing from") {
+			"eth_call object missing from") {
 			return *new(*temporpc.JSONRPCResponse), *new(error)
 		}
 		if !assert.Equalf(t, request.Currency, callObject["feeToken"],
-			"estimateGas feeToken = %v, want %s", callObject["feeToken"], request.Currency) {
+			"eth_call feeToken = %v, want %s", callObject["feeToken"], request.Currency) {
 			return *new(*temporpc.JSONRPCResponse), *new(error)
 		}
 
 		calls, ok := callObject["calls"].([]map[string]any)
 		if !assert.Falsef(t, !ok || len(calls) == 0,
-			"estimateGas calls = %#v, want non-empty call batch", callObject["calls"]) {
+			"eth_call calls = %#v, want non-empty call batch", callObject["calls"]) {
 			return *new(*temporpc.JSONRPCResponse), *new(error)
 		}
 		{
 
 			_, ok := callObject["nonceKey"]
 			if !assert.True(t, ok,
-				"estimateGas call object missing nonceKey") {
+				"eth_call object missing nonceKey") {
 				return *new(*temporpc.JSONRPCResponse), *new(error)
 			}
 		}
@@ -974,7 +1514,7 @@ func TestChargeFlow_FeePayerTransactionFailsPreflightBeforeBroadcast(t *testing.
 
 			_, ok := callObject["validBefore"]
 			if !assert.True(t, ok,
-				"estimateGas call object missing validBefore") {
+				"eth_call object missing validBefore") {
 				return *new(*temporpc.JSONRPCResponse), *new(error)
 			}
 		}
@@ -990,7 +1530,8 @@ func TestChargeFlow_FeePayerTransactionFailsPreflightBeforeBroadcast(t *testing.
 		return
 	}
 
-	intent, err := NewIntent(IntentConfig{RPC: rpc, FeePayerPrivateKey: feePayerKey})
+	store := newRecordingStore()
+	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store, FeePayerPrivateKey: feePayerKey})
 	if !assert.NoErrorf(t, err,
 		"NewIntent() error = %v", err) {
 		return
@@ -1007,10 +1548,12 @@ func TestChargeFlow_FeePayerTransactionFailsPreflightBeforeBroadcast(t *testing.
 		"expected no broadcast after failed preflight, got %d", len(rpc.sentRawTxs)) {
 		return
 	}
-	if !assert.Falsef(t, len(rpc.estimateGasCalls) < 2,
-		"expected client estimate and server preflight calls, got %d", len(rpc.estimateGasCalls)) {
+	if !assert.Lenf(t, rpc.callRequests, 2,
+		"expected sender and final-envelope simulations, got %d", len(rpc.callRequests)) {
 		return
 	}
+	assert.Equal(t, 1, store.putIfAbsentCalls)
+	assert.Equal(t, 1, store.deleteCalls)
 
 }
 

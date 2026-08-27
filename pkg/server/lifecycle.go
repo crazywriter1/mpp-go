@@ -17,7 +17,7 @@ func validateCredential(
 	request map[string]any,
 	method string,
 ) (*Validation, error) {
-	split, ok := intent.(*splitHookIntent)
+	validating, ok := intent.(ValidatingIntent)
 	if !ok {
 		err := mpp.ErrVerificationFailed(fmt.Sprintf(
 			"%s/%s does not support non-mutating credential validation",
@@ -27,7 +27,21 @@ func validateCredential(
 		err.Details = map[string]any{"intent": intent.Name(), "method": method}
 		return nil, err
 	}
-	return split.validate(ctx, credential, request)
+	return validating.Validate(ctx, credential, request)
+}
+
+// broadcastCredential dispatches the split lifecycle when available and keeps
+// legacy intents on their combined Verify path.
+func broadcastCredential(
+	ctx context.Context,
+	intent Intent,
+	credential *mpp.Credential,
+	request map[string]any,
+) (*mpp.Receipt, error) {
+	if broadcasting, ok := intent.(BroadcastingIntent); ok {
+		return broadcasting.Broadcast(ctx, credential, request)
+	}
+	return intent.Verify(ctx, credential, request)
 }
 
 // prepareCredential authenticates the echoed stateless challenge, enforces its

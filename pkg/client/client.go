@@ -14,14 +14,37 @@ import (
 type Method interface {
 	// Name returns the method name this handler supports (e.g., "tempo").
 	Name() string
+	// Intent returns the payment intent this handler supports (e.g., "charge").
+	Intent() string
 	// CreateCredential creates a payment credential for the given challenge.
 	CreateCredential(ctx context.Context, challenge *mpp.Challenge) (*mpp.Credential, error)
 }
 
+// ChallengeMatcher may be implemented by a Method that only handles some
+// challenges for its method and intent. It allows multiple handlers for the
+// same method and intent to select between method-specific request details.
+type ChallengeMatcher interface {
+	CanHandleChallenge(challenge *mpp.Challenge) bool
+}
+
+// PaymentPreferences assigns HTTP q-values to configured payment methods.
+// Keys use the "method/intent" form. Omitted methods default to q=1.
+type PaymentPreferences map[string]float64
+
+type methodKey struct {
+	name   string
+	intent string
+}
+
+func keyForMethod(method Method) methodKey {
+	return methodKey{name: method.Name(), intent: method.Intent()}
+}
+
 // Client is an HTTP client with automatic 402 payment handling.
 type Client struct {
-	methods    map[string]Method
-	httpClient *http.Client
+	methods            []Method
+	httpClient         *http.Client
+	paymentPreferences PaymentPreferences
 }
 
 // Option configures the Client.
@@ -34,14 +57,20 @@ func WithHTTPClient(c *http.Client) Option {
 	}
 }
 
+// WithPaymentPreferences sets client payment preferences. The preferences are
+// advertised in Accept-Payment and used to rank server challenges. Unknown
+// keys and invalid q-values cause Do to fail before sending the request.
+func WithPaymentPreferences(preferences PaymentPreferences) Option {
+	return func(c *Client) {
+		c.paymentPreferences = clonePaymentPreferences(preferences)
+	}
+}
+
 // New creates a Client with the given payment methods.
 func New(methods []Method, opts ...Option) *Client {
 	c := &Client{
-		methods:    make(map[string]Method, len(methods)),
+		methods:    append([]Method(nil), methods...),
 		httpClient: http.DefaultClient,
-	}
-	for _, m := range methods {
-		c.methods[m.Name()] = m
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -60,10 +89,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	origin := requestOrigin(req.URL)
 	req = req.WithContext(withPaymentOrigin(req.Context(), origin))
 
-	transport := &Transport{
-		methods: c.methods,
-		inner:   inner,
-	}
+	transport := NewTransport(c.methods, inner, WithTransportPaymentPreferences(c.paymentPreferences))
 
 	// Use a copy of the http.Client with our payment-aware transport.
 	hc := *c.httpClient
