@@ -1096,46 +1096,61 @@ func TestChargeFlow_HashCredentialIgnoresFeeControllerLogs(t *testing.T) {
 	}
 }
 
-func TestChargeFlow_HashCredentialRejectsExplicitPrimaryMemo(t *testing.T) {
+func TestChargeFlow_HashCredentialAcceptsExplicitPrimaryMemo(t *testing.T) {
 	ctx := context.Background()
-	request, err := tempo.NormalizeChargeRequest(tempo.ChargeRequestParams{
+	method := NewMethod(MethodConfig{
+		Currency:  testCurrency,
+		Recipient: testRecipient,
+		Decimals:  6,
+		ChainID:   42431,
+	})
+	requestMap, err := method.BuildChargeRequest(server.ChargeParams{
 		Amount:         "0.50",
-		Currency:       testCurrency,
-		Recipient:      testRecipient,
-		Decimals:       6,
-		ChainID:        42431,
 		Memo:           "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
 		SupportedModes: []tempo.ChargeMode{tempo.ChargeModePush},
 	})
 	if !assert.NoErrorf(t, err,
-		"NormalizeChargeRequest() error = %v", err) {
+		"BuildChargeRequest() error = %v", err) {
 		return
 	}
-
-	signer, err := temposigner.NewSigner(testPrivateKey)
+	request, err := tempo.ParseChargeRequest(requestMap)
 	if !assert.NoErrorf(t, err,
-		"NewSigner() error = %v", err) {
+		"ParseChargeRequest() error = %v", err) {
+		return
+	}
+	if !assert.Equal(t, []tempo.ChargeMode{tempo.ChargeModePush}, request.MethodDetails.SupportedModes) {
 		return
 	}
 
+	rpc := newMockRPC(request)
 	challenge := buildChallenge(t, request)
-	credential := &mpp.Credential{
-		Challenge: challenge.ToEcho(),
-		Payload: tempo.ChargeCredentialPayload{
-			Type: tempo.CredentialTypeHash,
-			Hash: testReceiptHash,
-		}.Map(),
-		Source: tempo.ProofSource(42431, signer.Address()),
+	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeHash).CreateCredential(ctx, challenge)
+	if !assert.NoErrorf(t, err,
+		"CreateCredential() error = %v", err) {
+		return
 	}
 
-	intent, err := NewIntent(IntentConfig{RPC: newMockRPC(request)})
+	intent, err := NewIntent(IntentConfig{RPC: rpc})
 	if !assert.NoErrorf(t, err,
 		"NewIntent() error = %v", err) {
 		return
 	}
 
-	if _, err := intent.Verify(ctx, credential, request.Map()); err == nil || !strings.Contains(err.Error(), "explicit memo") {
-		assert.Failf(t, "", "Verify() error = %v, want explicit memo rejection", err)
+	wrongMemoRequest := request
+	wrongMemoRequest.MethodDetails.Memo = "0x2020202020202020202020202020202020202020202020202020202020202020"
+	if _, err := intent.Verify(ctx, credential, wrongMemoRequest.Map()); err == nil || !strings.Contains(err.Error(), "does not satisfy") {
+		assert.Failf(t, "", "Verify() error = %v, want memo mismatch", err)
+		return
+	}
+
+	receipt, err := intent.Verify(ctx, credential, request.Map())
+	if !assert.NoErrorf(t, err, "Verify() error = %v", err) ||
+		!assert.Equal(t, testReceiptHash, receipt.Reference) {
+		return
+	}
+
+	if _, err := intent.Verify(ctx, credential, request.Map()); err == nil || !strings.Contains(err.Error(), "already used") {
+		assert.Failf(t, "", "Verify() error = %v, want hash replay rejection", err)
 		return
 	}
 }
