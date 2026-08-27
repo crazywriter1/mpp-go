@@ -187,11 +187,12 @@ func writeComposeMalformedCredentialError(
 ) {
 	var challenges []*mpp.Challenge
 	if cred != nil {
-		if entry, ok := findEntryByMethodIntent(entries, cred); ok {
+		for _, entry := range findEntriesByMethodIntent(entries, cred) {
 			challenge, chErr := freshComposeChallenge(r.Context(), entry, body, scope)
-			if chErr == nil && challenge != nil {
-				challenges = []*mpp.Challenge{challenge}
+			if chErr != nil || challenge == nil {
+				continue
 			}
+			challenges = append(challenges, challenge)
 		}
 	}
 	if len(challenges) == 0 {
@@ -206,12 +207,18 @@ func writeComposeMalformedCredentialError(
 }
 
 func writeComposeChallengeResponse(w http.ResponseWriter, challenges []*mpp.Challenge, realm string, err error) {
+	// Serialize every challenge before writing headers so a later
+	// ToAuthenticateStrict failure cannot leave a partial usable set.
+	headers := make([]string, 0, len(challenges))
 	for _, challenge := range challenges {
 		header, headerErr := challenge.ToAuthenticateStrict(realm)
 		if headerErr != nil {
 			WritePaymentError(w, mpp.ErrBadRequest(headerErr.Error()))
 			return
 		}
+		headers = append(headers, header)
+	}
+	for _, header := range headers {
 		w.Header().Add(mpp.HeaderWWWAuthenticate, header)
 	}
 
@@ -233,7 +240,12 @@ func isMalformedCredential(err error) bool {
 	return ok && pe.Type == mpp.ErrorTypeMalformedCredential
 }
 
-func findEntryByMethodIntent(entries []composedEntry, cred *mpp.Credential) (composedEntry, bool) {
+// findEntriesByMethodIntent returns every compose entry whose method and intent
+// match the credential. Multiple configs can share method+intent while differing
+// by amount, currency, or opaque metadata; reissue all of them so the client can
+// retry the option it originally selected.
+func findEntriesByMethodIntent(entries []composedEntry, cred *mpp.Credential) []composedEntry {
+	var matched []composedEntry
 	for _, entry := range entries {
 		method := entry.mpp.method
 		if cred.Challenge.Method != method.Name() {
@@ -242,9 +254,9 @@ func findEntryByMethodIntent(entries []composedEntry, cred *mpp.Credential) (com
 		if _, ok := method.Intents()[cred.Challenge.Intent]; !ok {
 			continue
 		}
-		return entry, true
+		matched = append(matched, entry)
 	}
-	return composedEntry{}, false
+	return matched
 }
 
 // findMatchingEntry selects the entry whose method, intent, and canonical
