@@ -562,6 +562,139 @@ func TestComposeMiddleware_ReturnsMalformedCredentialForInvalidEchoedRequest(t *
 		return
 	}
 
+	if !assert.NotEmpty(t, paid.Header.Values(mpp.HeaderWWWAuthenticate),
+		"expected fresh WWW-Authenticate challenge on malformed credential") {
+		return
+	}
+
+}
+
+func TestComposeMiddleware_ReissuesAllSameMethodChallengesForMalformedCredential(t *testing.T) {
+	// Same method+intent with different amounts: a malformed echoed request
+	// must reissue every matching option, not only the first compose entry.
+	methodCheap := newTestServer(t, composeTestMethod{name: "tempo"}, composeRealm, composeSecret)
+	methodExpensive := newTestServer(t, composeTestMethod{name: "tempo"}, composeRealm, composeSecret)
+
+	srv := composeTestServer(t,
+		ComposeConfig{Mpp: methodCheap, Params: ChargeParams{Amount: "0.01"}},
+		ComposeConfig{Mpp: methodExpensive, Params: ChargeParams{Amount: "10.00"}},
+	)
+	defer srv.Close()
+
+	resp := getChallenge(t, srv.URL)
+	var expensiveChallenge *mpp.Challenge
+	for _, h := range resp.Header.Values(mpp.HeaderWWWAuthenticate) {
+		c, err := mpp.ParseChallenge(h)
+		if !assert.NoErrorf(t, err, "ParseChallenge() error = %v", err) {
+			resp.Body.Close()
+			return
+		}
+		if amt, ok := c.Request["amount"]; ok && amt == "10.00" {
+			expensiveChallenge = c
+			break
+		}
+	}
+	resp.Body.Close()
+	if !assert.NotNil(t, expensiveChallenge, "did not find the 10.00 amount challenge") {
+		return
+	}
+
+	credential := &mpp.Credential{
+		Challenge: expensiveChallenge.ToEcho(),
+		Payload:   map[string]any{"type": "hash", "hash": "0xabc"},
+	}
+	credential.Challenge.Request = "%%%"
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if !assert.NoErrorf(t, err, "http.NewRequest() error = %v", err) {
+		return
+	}
+	req.Header.Set("Authorization", credential.ToAuthorization())
+
+	paid, err := http.DefaultClient.Do(req)
+	if !assert.NoErrorf(t, err, "Do() error = %v", err) {
+		return
+	}
+	defer paid.Body.Close()
+
+	if !assert.Equalf(t, http.StatusPaymentRequired, paid.StatusCode,
+		"status = %d, want %d", paid.StatusCode, http.StatusPaymentRequired) {
+		return
+	}
+
+	wwwAuth := paid.Header.Values(mpp.HeaderWWWAuthenticate)
+	if !assert.Lenf(t, wwwAuth, 2,
+		"got %d WWW-Authenticate headers, want both tempo amount options", len(wwwAuth)) {
+		return
+	}
+
+	amounts := map[string]bool{}
+	for _, h := range wwwAuth {
+		c, err := mpp.ParseChallenge(h)
+		if !assert.NoErrorf(t, err, "ParseChallenge() error = %v", err) {
+			return
+		}
+		assert.Equal(t, "tempo", c.Method)
+		if amt, ok := c.Request["amount"].(string); ok {
+			amounts[amt] = true
+		}
+	}
+	assert.True(t, amounts["0.01"], "missing 0.01 challenge")
+	assert.True(t, amounts["10.00"], "missing 10.00 challenge")
+
+	var problem struct {
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(paid.Body).Decode(&problem); err != nil {
+		assert.Failf(t, "", "Decode(problem) error = %v", err)
+		return
+	}
+	assert.Equal(t, string(mpp.ErrorTypeMalformedCredential), problem.Type)
+}
+
+func TestComposeMiddleware_ReturnsFreshChallengeForUnparseableCredential(t *testing.T) {
+	methodA := newTestServer(t, composeTestMethod{name: "alpha"}, composeRealm, composeSecret)
+	methodB := newTestServer(t, composeTestMethod{name: "beta"}, composeRealm, composeSecret)
+
+	srv := composeTestServer(t,
+		ComposeConfig{Mpp: methodA, Params: ChargeParams{Amount: "1.00"}},
+		ComposeConfig{Mpp: methodB, Params: ChargeParams{Amount: "2.00"}},
+	)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if !assert.NoErrorf(t, err,
+		"http.NewRequest() error = %v", err) {
+		return
+	}
+	req.Header.Set("Authorization", "Payment !!!not-valid-base64!!!")
+
+	resp, err := http.DefaultClient.Do(req)
+	if !assert.NoErrorf(t, err,
+		"Do() error = %v", err) {
+		return
+	}
+	defer resp.Body.Close()
+
+	if !assert.Equalf(t, http.StatusPaymentRequired, resp.StatusCode,
+		"status = %d, want %d", resp.StatusCode, http.StatusPaymentRequired) {
+		return
+	}
+
+	wwwAuth := resp.Header.Values("WWW-Authenticate")
+	if !assert.Lenf(t, wwwAuth, 2,
+		"got %d WWW-Authenticate headers, want 2 fresh compose challenges", len(wwwAuth)) {
+		return
+	}
+
+	var problem struct {
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		assert.Failf(t, "", "Decode(problem) error = %v", err)
+		return
+	}
+	assert.Equal(t, string(mpp.ErrorTypeMalformedCredential), problem.Type)
 }
 
 func TestComposeMiddleware_SingleMethod(t *testing.T) {
@@ -622,6 +755,41 @@ func TestComposeMiddlewareRejectsCRLFChallengeDescription(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Empty(t, resp.Header.Values("WWW-Authenticate"))
+
+	var problem struct {
+		Type string `json:"type"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&problem))
+	assert.Equal(t, string(mpp.ErrorTypeBadRequest), problem.Type)
+}
+
+func TestComposeMiddleware_DoesNotWritePartialChallengesOnSerializeFailure(t *testing.T) {
+	// A later challenge that fails strict serialization must not leave earlier
+	// WWW-Authenticate headers already written on the response.
+	methodA := newTestServer(t, composeTestMethod{name: "alpha"}, composeRealm, composeSecret)
+	methodB := newTestServer(t, composeTestMethod{name: "beta"}, composeRealm, composeSecret)
+
+	srv := composeTestServer(t,
+		ComposeConfig{Mpp: methodA, Params: ChargeParams{Amount: "1.00"}},
+		ComposeConfig{
+			Mpp: methodB,
+			Params: ChargeParams{
+				Amount:      "2.00",
+				Description: "Line one\r\nLine two",
+			},
+		},
+	)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if !assert.NoErrorf(t, err, "http.Get() error = %v", err) {
+		return
+	}
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, resp.Header.Values(mpp.HeaderWWWAuthenticate),
+		"partial WWW-Authenticate headers must not be written before serialize failure")
 
 	var problem struct {
 		Type string `json:"type"`

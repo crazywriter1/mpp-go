@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -82,12 +83,16 @@ func ComposeMiddleware(configs ...ComposeConfig) func(http.Handler) http.Handler
 			// Credential present — find the matching entry.
 			cred, err := mpp.ParseCredential(paymentAuth)
 			if err != nil {
-				WritePaymentError(w, mpp.ErrMalformedCredential(err.Error()))
+				writeComposeMalformedCredentialError(w, r, entries, realm, body, scope, nil, mpp.ErrMalformedCredential(err.Error()))
 				return
 			}
 
 			entry, ok, err := findMatchingEntry(entries, cred, scope)
 			if err != nil {
+				if isMalformedCredential(err) {
+					writeComposeMalformedCredentialError(w, r, entries, realm, body, scope, cred, err)
+					return
+				}
 				WritePaymentError(w, err)
 				return
 			}
@@ -128,51 +133,130 @@ func ComposeMiddleware(configs ...ComposeConfig) func(http.Handler) http.Handler
 // composeChallenges issues a 402 with all configured challenges merged into
 // separate WWW-Authenticate header values.
 func composeChallenges(w http.ResponseWriter, r *http.Request, entries []composedEntry, realm string, body []byte, scope map[string]string) {
+	challenges, err := collectComposeChallenges(r.Context(), entries, body, scope)
+	if err != nil {
+		WritePaymentError(w, err)
+		return
+	}
+	writeComposeChallengeResponse(w, challenges, realm, nil)
+}
+
+func collectComposeChallenges(ctx context.Context, entries []composedEntry, body []byte, scope map[string]string) ([]*mpp.Challenge, error) {
 	var challenges []*mpp.Challenge
 	for _, entry := range entries {
-		params := entry.params
-		params.Authorization = ""
-		if len(scope) > 0 {
-			params.MppxScope = scope
-		}
-		if len(body) > 0 {
-			params.Body = body
-		}
-
-		result, err := entry.mpp.Charge(r.Context(), params)
+		challenge, err := freshComposeChallenge(ctx, entry, body, scope)
 		if err != nil {
+			return nil, err
+		}
+		if challenge != nil {
+			challenges = append(challenges, challenge)
+		}
+	}
+	if len(challenges) == 0 {
+		return nil, mpp.ErrBadRequest("no challenges could be generated")
+	}
+	return challenges, nil
+}
+
+func freshComposeChallenge(ctx context.Context, entry composedEntry, body []byte, scope map[string]string) (*mpp.Challenge, error) {
+	params := entry.params
+	params.Authorization = ""
+	if len(scope) > 0 {
+		params.MppxScope = scope
+	}
+	if len(body) > 0 {
+		params.Body = body
+	}
+
+	result, err := entry.mpp.Charge(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	return result.Challenge, nil
+}
+
+func writeComposeMalformedCredentialError(
+	w http.ResponseWriter,
+	r *http.Request,
+	entries []composedEntry,
+	realm string,
+	body []byte,
+	scope map[string]string,
+	cred *mpp.Credential,
+	err error,
+) {
+	var challenges []*mpp.Challenge
+	if cred != nil {
+		for _, entry := range findEntriesByMethodIntent(entries, cred) {
+			challenge, chErr := freshComposeChallenge(r.Context(), entry, body, scope)
+			if chErr != nil || challenge == nil {
+				continue
+			}
+			challenges = append(challenges, challenge)
+		}
+	}
+	if len(challenges) == 0 {
+		var collectErr error
+		challenges, collectErr = collectComposeChallenges(r.Context(), entries, body, scope)
+		if collectErr != nil {
 			WritePaymentError(w, err)
 			return
 		}
-		if result.Challenge != nil {
-			challenges = append(challenges, result.Challenge)
-		}
 	}
+	writeComposeChallengeResponse(w, challenges, realm, err)
+}
 
-	if len(challenges) == 0 {
-		WritePaymentError(w, mpp.ErrBadRequest("no challenges could be generated"))
-		return
-	}
-
-	var headers []string
+func writeComposeChallengeResponse(w http.ResponseWriter, challenges []*mpp.Challenge, realm string, err error) {
+	// Serialize every challenge before writing headers so a later
+	// ToAuthenticateStrict failure cannot leave a partial usable set.
+	headers := make([]string, 0, len(challenges))
 	for _, challenge := range challenges {
-		header, err := challenge.ToAuthenticateStrict(realm)
-		if err != nil {
-			WritePaymentError(w, mpp.ErrBadRequest(err.Error()))
+		header, headerErr := challenge.ToAuthenticateStrict(realm)
+		if headerErr != nil {
+			WritePaymentError(w, mpp.ErrBadRequest(headerErr.Error()))
 			return
 		}
 		headers = append(headers, header)
 	}
-
 	for _, header := range headers {
 		w.Header().Add(mpp.HeaderWWWAuthenticate, header)
 	}
+
+	if err != nil {
+		WritePaymentError(w, err)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusPaymentRequired)
 
 	problem := mpp.ErrPaymentRequired(realm, "")
 	json.NewEncoder(w).Encode(problem.ProblemDetails(""))
+}
+
+func isMalformedCredential(err error) bool {
+	pe, ok := err.(*mpp.PaymentError)
+	return ok && pe.Type == mpp.ErrorTypeMalformedCredential
+}
+
+// findEntriesByMethodIntent returns every compose entry whose method and intent
+// match the credential. Multiple configs can share method+intent while differing
+// by amount, currency, or opaque metadata; reissue all of them so the client can
+// retry the option it originally selected.
+func findEntriesByMethodIntent(entries []composedEntry, cred *mpp.Credential) []composedEntry {
+	var matched []composedEntry
+	for _, entry := range entries {
+		method := entry.mpp.method
+		if cred.Challenge.Method != method.Name() {
+			continue
+		}
+		if _, ok := method.Intents()[cred.Challenge.Intent]; !ok {
+			continue
+		}
+		matched = append(matched, entry)
+	}
+	return matched
 }
 
 // findMatchingEntry selects the entry whose method, intent, and canonical
