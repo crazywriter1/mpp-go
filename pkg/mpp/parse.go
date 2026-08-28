@@ -1,9 +1,11 @@
 package mpp
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -612,14 +614,33 @@ func isHTTPHeaderName(value string) bool {
 }
 
 // B64Decode decodes a base64url (no padding) string into a map.
+//
+// Numbers decode as json.Number rather than float64. The challenge ID is an
+// HMAC over the re-encoded request, so a decode that cannot reproduce the
+// bytes it was given cannot reproduce the ID either: float64 carries 53 bits
+// of mantissa, and any JSON integer above 2^53 comes back rounded, making a
+// challenge the server itself issued fail to verify.
 func B64Decode(s string) (map[string]any, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
+	m, err := decodeJSONMap(raw)
+	if err != nil {
 		return nil, fmt.Errorf("json decode: %w", err)
+	}
+	return m, nil
+}
+
+func decodeJSONMap(raw []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var m map[string]any
+	if err := decoder.Decode(&m); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("unexpected trailing data")
 	}
 	return m, nil
 }
